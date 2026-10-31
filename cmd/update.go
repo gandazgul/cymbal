@@ -68,7 +68,8 @@ func shouldSkipPassiveUpdateNotice(cmd *cobra.Command) bool {
 	if !cmd.Runnable() {
 		return true
 	}
-	if getJSONFlag(cmd) {
+	quiet, _ := cmd.Flags().GetBool("quiet")
+	if getJSONFlag(cmd) || quiet {
 		return true
 	}
 	v := strings.TrimSpace(strings.ToLower(os.Getenv("CI")))

@@ -1,0 +1,4 @@
+{
+  "verification_command": "make ci",
+  "worktree_setup_command": "go mod download && npm --prefix site ci"
+}

@@ -25,7 +25,7 @@ Thumbs.db
 bench/.corpus/
 
 # Local planning scratchpad
-plans/
+/plans/
 
 # Local agent and scratch state, never part of a commit
 .worktrees/
@@ -36,3 +36,6 @@ plans/
 .review/
 .tmp-smoke/
 .brainfile/
+# BEGIN RunWield owned runtime state
+.wld/internal/
+# END RunWield owned runtime state

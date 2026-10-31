@@ -11,7 +11,8 @@ Path/language heuristics recognize some special filenames such as `Dockerfile`, 
 | `-d, --db <path>` | Override path to cymbal database (default: auto-resolved per repo) |
 | `--json` | Output as JSON instead of frontmatter+content |
 
-Passive update notices are suppressed automatically for `--json` output. Set `CYMBAL_NO_UPDATE_NOTIFIER=1` to disable passive update notices entirely.
+Passive update notices are suppressed automatically for `--json` output and
+`affected-tests --quiet`. Set `CYMBAL_NO_UPDATE_NOTIFIER=1` to disable passive update notices entirely.
 
 Query commands refresh the index before reading it and exit nonzero if that refresh fails. For a name the index knows, `impact`, `trace`, `refs`, `impls` and `investigate` exit 0 even when the answer is empty, with their usual output and a zero count, such as `total_callers: 0` or an empty `results` list in JSON. A name the index has never seen exits nonzero with `symbol not found: <name>`, as in `show` and `context`. A name that is only referenced, like a call to an external `Println` or an interface such as `io.Reader` named in an `implements` clause or an embedding, is known to `impact`, `trace`, `refs` and `impls`; `investigate` needs a definition. Those four match bare names, so ask for `Reader`, not `io.Reader`. In a batch, all five print the names that resolved and exit nonzero for the rest (`impls --json` and `investigate --json` still list a missing name, with its error), and `outline` keeps the files that worked when another fails, so batch consumers should check the exit status as well as the payload. An empty outline is not an error, and `search` exits nonzero when it has no matches.
 
@@ -545,6 +546,202 @@ Operates only on the current worktree. Counts are name-scoped (cymbal resolves
 references by name); arbitrary commit ranges (`a..b`) and deleted-symbol impact
 are out of scope. Deleted/binary/unsupported files are reported, not silently
 dropped.
+
+---
+
+## `cymbal affected-tests`
+
+Select ranked, explainable **test paths**, not runnable test cases. This is an
+advisory selector, not a test runner or coverage guarantee. Requirement source:
+[issue #77](https://github.com/1broseidon/cymbal/issues/77).
+
+```sh
+cymbal affected-tests [files...] [flags]
+```
+
+### Input modes and scope
+
+| Input | Comparison / precision |
+|-------|------------------------|
+| No files or `--stdin` | Unstaged working tree versus index; hunk precision; excludes untracked files |
+| `--staged` | Index versus HEAD; hunk precision from staged blobs, even if disk differs |
+| `--base <ref>` | Working tree versus one ref; hunk precision, not a commit range |
+| Positional files | All indexed definitions in those files; file precision |
+| `--stdin` | Newline-separated files; file precision; may combine with positional files |
+
+Diff attribution parses both old and new blobs. The dependency graph always
+comes from the refreshed **current working tree**, including in staged/base
+modes. Deleted definitions and staged definitions that do not match a live
+indexed identity remain limitations; a same-name definition is not substituted
+as a proven target.
+
+All modes require the current Git repository. The command refreshes its index
+and never federates across sibling worktrees; `--no-federate` is not needed.
+`-d, --db <path>` and `CYMBAL_DB` can select the database, but its stored
+repository root must match the current repository. A mismatched root is an
+error, not a way to query another checkout.
+
+### Flags and conflicts
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--staged` | `false` | Use staged diff mode |
+| `--base <ref>` | unset | Use one Git ref; reject refs starting with `-` and ranges such as `a..b` |
+| `--stdin` | `false` | Read file paths, not symbol names or comments |
+| `-D, --depth <n>` | `2` | Maximum symbol and reverse-import dependency depth; 1–5 |
+| `-n, --limit <n>` | `50` | Maximum selected test files, applied after ranking; positive only |
+| `--max-symbols <n>` | `40` | Maximum seed definitions; 0 = unlimited, negative invalid |
+| `--max-evidence <n>` | `500` | Maximum examined dependency records across the query; 0 = unlimited, negative invalid |
+| `--test-path <pat>` | built-ins only | Add test classification patterns; substring or glob with `**`; repeatable |
+| `--resolve-scope <s>` | `family` | Name matching in `same` language, language `family`, or `all` languages |
+| `--quiet` | `false` | Only selected paths on stdout, one per line; warnings/advice on stderr |
+| `--json` | `false` | Structured result in the shared JSON envelope |
+
+`--staged` and `--base` conflict. File inputs (including `--stdin`) cannot be
+combined with either diff flag. `--json` and `--quiet` conflict. Invalid options
+are rejected before Git analysis or index refresh. There is no graph output
+mode for this command.
+
+```sh
+cymbal affected-tests
+cymbal affected-tests --staged --depth 3
+cymbal affected-tests --base main --json
+cymbal affected-tests 'src/auth handler.ts' --test-path 'qa/**'
+printf '%s\n' 'src/auth.ts' '#helper.ts' | cymbal affected-tests src/api.ts --stdin --quiet
+```
+
+### Path input rules
+
+- Arguments and stdin form a deduplicated union. Empty stdin with `--stdin`
+  means empty explicit input, **not** the default working diff.
+- Stdin accepts CRLF and skips empty lines. Spaces and leading `#` are
+  preserved; lines are not trimmed or interpreted as comments.
+- Relative paths resolve from the current working directory, including when
+  it is a subdirectory. Output paths are repository-relative with `/` separators.
+- Both `/` and `\` are separators on all platforms. A literal backslash in a
+  Unix filename cannot be distinguished from a separator. Windows drive paths
+  are not treated as relative Unix filenames.
+- Paths outside the current repository, including symlink escapes, are rejected.
+  Missing in-repository files are reported as limitations. Symbolic-link inputs
+  are not indexed.
+- Supply files, not directories. Cymbal adds no glob expansion, directory
+  expansion, or shell evaluation. Quote paths to prevent unwanted shell expansion.
+- Newline-separated input/output cannot represent filenames containing newlines;
+  this command has no NUL-delimited mode.
+
+### Evidence, ranking, and confidence
+
+Candidates use this strength order:
+
+| Order | Evidence kind | Meaning |
+|-------|---------------|---------|
+| 1 | `changed_test` | The existing changed file itself is classified as test; distance 0 |
+| 2 | `direct_symbol` | A test directly calls or uses a changed name, including top-level expressions |
+| 3 | `transitive_symbol` | Reverse references reach a test through production or unknown-class symbols |
+| 4 | `direct_import` | A test directly imports a path heuristically matched to the changed file/package |
+| 5 | `colocated` | An existing same-directory test matches the source stem; no dependency distance |
+| 6 | `reverse_import` | Multiple reverse imports reach a test when the seed lacks symbol-backed test evidence, or usable symbols are absent |
+
+Sort by strongest evidence class, its shortest distance, ambiguity penalty,
+independent support count within that class descending, then normalized path. Distinct terminal
+reference/import sites or changed seeds give independent support; repeated
+input or repeated discovery of the same evidence does not. Many weak matches
+do not outrank a stronger class. Retain canonical shortest explanations, with
+lexical location-bearing steps breaking equal-path ties; sort evidence and
+changed-symbol lists too. Apply the result limit last and assign 1-based ranks,
+not numeric scores. Identical repository state, options, and implementation
+produce identical ordering; algorithm releases need not keep the same ranking.
+
+Confidence measures evidence strength, **not coverage probability**:
+
+- `high`: a changed test itself, or unambiguous direct symbol evidence from
+  hunk-precise input.
+- `medium`: unambiguous transitive symbol evidence, or direct symbol evidence
+  from whole-file input.
+- `low`: ambiguous symbol paths, import-only evidence, or naming-only evidence.
+
+Any ambiguity in an explanation lowers its confidence. A selected path takes
+its confidence from its best retained evidence, not a count of weak matches.
+Its `distance` is the shortest actual dependency distance across its evidence;
+that can differ from the distance used for ranking its strongest class. A
+naming-only match has `distance: null`.
+
+### Static analysis and test classification limits
+
+References are name matches, not full semantic resolution. Actual `call`, `use`,
+and `implements` kinds are retained. Aliases, callbacks, reflection, and
+interface dispatch are not fully resolved. Encountered indirect-dispatch
+boundaries and ambiguous definitions cause gap reports; an otherwise completed
+supported scan is not forced to `partial` merely because static analysis has
+general limits.
+
+Import matching uses raw-path suffix, basename/stem, and nonempty package-directory
+heuristics, not a module resolver. Basename collisions and broad package matches
+stay low-confidence; evidence keeps the raw import and matched target. Static
+JS/TS `export ... from` and `export * from` barrel re-exports are indexed as
+imports. Existing indexes reparse unchanged files once on the next full refresh
+to acquire these edges; a failed or scoped upgrade does not complete that upgrade.
+This does not add alias or dynamic-import resolution.
+
+Traversal stops at the first file classified as test. For example,
+`tests/helpers.ts`, `testdata/*`, and `conftest.py` can be terminal selections,
+not runnable tests. Unknown-class helpers such as `testutil/*` remain traversable.
+A changed classified test is selected directly, not traversed to infer consumers.
+`--test-path` changes these boundaries, not just display labels.
+
+Colocated inference uses **existing indexed files** in the same directory:
+
+- Go: `<stem>_test.go`.
+- JS/TS: `<stem>.test.<ext>` or `<stem>.spec.<ext>`, across counterpart extensions
+  `js`, `jsx`, `ts`, `tsx`, `mjs`, `cjs`, `mts`, `cts`.
+- Python: `test_<stem>.py` or `<stem>_test.py` for a `.py` source.
+
+Other classification conventions can select tests through references, imports,
+or changed-test inclusion; they do not imply universal source-to-test naming
+inference. Generated/excluded/unindexed files are not a complete test inventory.
+
+### Result contract, status, and exit behavior
+
+`--json` uses the unchanged outer envelope
+`{ "version": "0.1", "results": ... }`. Inside `results`, `schema_version: 1`
+versions the affected-test contract separately. Existing field meanings are
+preserved within schema 1; additive fields are allowed and consumers must
+tolerate unknown fields. Breaking changes require a new schema version. This
+is not a promise of identical rankings across releases.
+
+The result contains `schema_version`, `status`, `input_precision` (`hunk` or
+`file`), effective `bounds`, `tests`, `limitations`, `fallback`, `advisory`, and
+`static_analysis_limit`. Each test has `path`, `rank`, `confidence`, `distance`,
+`changed_symbols`, and `evidence`. Evidence contains `kind`, `seed`, `distance`,
+`ambiguous`, `confidence`, and ordered location-bearing `steps`; import steps
+also retain `raw_import` and `target`. Seeds identify path, name, kind, language,
+line range, and deletion state. File-only selections have an empty
+`changed_symbols` list and a changed-file seed in evidence. Empty collections
+serialize as `[]`, not `null`.
+
+| Status | Meaning | Fallback |
+|--------|---------|----------|
+| `complete` | Supported static scan finished without a detected gap; an empty diff is complete with no tests | No automatic full-suite recommendation; still advisory |
+| `partial` | Some analysis was possible, but input, precision, traversal, or inference gaps remain | `fallback.recommended: true`; run the full suite |
+| `unavailable` | Nonempty input has no analyzable seed or applicable evidence | `fallback.recommended: true`; run the full suite |
+
+Finding no tests for an analyzed seed alone does not mean `unavailable`.
+Whole-file precision is a limitation. Limitations have stable `code`, explanatory
+`message`, affected `paths`, and `seeds`. They report seed/evidence/result/depth
+cutoffs, ambiguous or missing live/deleted definitions, renames, binary,
+unsupported, conflicted or unreadable input, content outside symbols, heuristic
+inference, and encountered indirect dispatch. Reaching a depth bound alone
+is not truncation unless further relationships remain.
+
+All successful analyses, including `partial` and `unavailable`, exit **0**.
+Validation, Git, refresh, and database/query errors exit **nonzero**, without a
+successful-looking result. Read the status and fallback, not just the exit code.
+Normal text shows ranks, explanations, limitations, and advice. Quiet output
+keeps stdout path-only and sends advice to stderr; passive update notices are
+suppressed. No mode runs tests or changes required validation.
+
+**Selection does not prove that unselected tests are safe to skip**, including
+when status is `complete` or no paths are selected.
 
 ---
 

@@ -95,100 +95,10 @@ when truncated. Operates only on the current worktree.`,
 			return fmt.Errorf("git diff: %w", err)
 		}
 
-		// Old-side blob revision per mode: index ("" -> :path) for the default
-		// unstaged diff, HEAD for --staged, the ref for --base. This matches the
-		// old side git diff itself compares against, so old-side line numbers
-		// align with the parsed old blob.
-		oldRev := "" // default: the index (unstaged diff compares working tree vs index)
-		switch {
-		case staged:
-			oldRev = "HEAD"
-		case base != "":
-			oldRev = base
-		}
-
-		// Attribute changed lines to symbols by parsing each diffed blob.
-		changed := map[string]map[string]struct{}{} // name -> referencing files
-		deleted := map[string]map[string]struct{}{} // name -> files it was removed from
-		var changedOrder, deletedOrder []string
-		add := func(m map[string]map[string]struct{}, order *[]string, name, file string) {
-			if m[name] == nil {
-				m[name] = map[string]struct{}{}
-				*order = append(*order, name)
-			}
-			if file != "" {
-				m[name][file] = struct{}{}
-			}
-		}
-
-		skipped := 0
-		conflicted := countConflictBlocks(string(out))
-		for _, f := range parseChangedFiles(string(out)) {
-			if f.Binary {
-				skipped++
-				continue
-			}
-			if f.OldPath == "" && f.NewPath == "" && len(f.OldLines) == 0 && len(f.NewLines) == 0 {
-				// Pure rename, copy, or mode-only change: a diff block with no
-				// ---/+++ headers and no hunks. No content changed, so it is
-				// neither analyzable nor a "no parseable symbols" skip.
-				continue
-			}
-			fileParsed := false
-
-			// New side: added/modified symbols, plus the set of names that
-			// survive — used to tell a modification from a deletion. Each side is
-			// judged by its own path's language (parseBlobSymbols), so an
-			// extension-changing rename still parses whichever side is code.
-			newNames := map[string]bool{}
-			newParsed := false
-			if f.NewPath != "" {
-				if blob, rerr := readNewSide(repoRoot, staged, f.NewPath); rerr == nil {
-					if newSyms, ok := parseBlobSymbols(blob, f.NewPath); ok {
-						newParsed = true
-						fileParsed = true
-						for i := range newSyms {
-							newNames[newSyms[i].Name] = true
-						}
-						for _, s := range innermostChanged(newSyms, f.NewLines) {
-							add(changed, &changedOrder, s.Name, f.NewPath)
-						}
-					}
-				}
-			}
-
-			// Old side: classify each changed old symbol. It's deleted only when
-			// the file is gone (NewPath == "") or the new side parsed cleanly and
-			// no longer has that name — never when the new side merely failed to
-			// parse, which would manufacture false deletions.
-			if f.OldPath != "" && len(f.OldLines) > 0 {
-				if blob, rerr := readOldSide(repoRoot, oldRev, f.OldPath); rerr == nil {
-					if oldSyms, ok := parseBlobSymbols(blob, f.OldPath); ok {
-						fileParsed = true
-						for _, s := range innermostChanged(oldSyms, f.OldLines) {
-							gone := f.NewPath == "" || (newParsed && !newNames[s.Name])
-							if gone {
-								add(deleted, &deletedOrder, s.Name, f.OldPath)
-							} else {
-								// Still present (or new side unknown): a modification.
-								// Prefer the new path when the file still exists.
-								file := f.NewPath
-								if file == "" {
-									file = f.OldPath
-								}
-								add(changed, &changedOrder, s.Name, file)
-							}
-						}
-					}
-				}
-			}
-
-			if !fileParsed {
-				skipped++ // binary, unsupported, oversized, or unreadable on both sides
-			}
-		}
-		sort.Strings(changedOrder)
-		sort.Strings(deletedOrder)
+		analysis := analyzeChangedDiff(repoRoot, staged, base, out)
+		changed, deleted := analysis.Changed, analysis.Deleted
+		changedOrder, deletedOrder := analysis.ChangedOrder, analysis.DeletedOrder
+		skipped, conflicted := analysis.Skipped, analysis.Conflicted
 
 		analyzed := changedOrder
 		symbolsTruncated := false
@@ -432,6 +342,10 @@ type changedFile struct {
 	OldLines         map[int]bool
 	NewLines         map[int]bool
 	Binary           bool
+	// Metadata paths also exist for headerless binary, rename, and mode blocks.
+	// OldPath/NewPath remain the ---/+++ paths for existing callers.
+	MetadataOldPath, MetadataNewPath string
+	Renamed, Copied                  bool
 }
 
 // parseChangedFiles walks unified diff output into per-file changed-line sets.
@@ -454,7 +368,11 @@ func parseChangedFiles(diff string) []changedFile {
 		switch {
 		case strings.HasPrefix(line, "diff --git "):
 			flush()
-			cur = &changedFile{OldLines: map[int]bool{}, NewLines: map[int]bool{}}
+			oldPath, newPath := changedMetadataPaths(strings.TrimPrefix(line, "diff --git "))
+			cur = &changedFile{
+				OldLines: map[int]bool{}, NewLines: map[int]bool{},
+				MetadataOldPath: oldPath, MetadataNewPath: newPath,
+			}
 			inHunk = false
 		case strings.HasPrefix(line, "diff --cc "), strings.HasPrefix(line, "diff --combined "):
 			// Combined diff (merge conflict): not analyzable as a two-side diff.
@@ -491,12 +409,30 @@ func parseChangedFiles(diff string) []changedFile {
 				oldLine++
 				newLine++
 			}
-		case strings.HasPrefix(line, "Binary files "):
+		case strings.HasPrefix(line, "Binary files "), line == "GIT binary patch":
 			cur.Binary = true
+		case strings.HasPrefix(line, "rename from "):
+			cur.Renamed = true
+			cur.MetadataOldPath = changedMetadataPath(strings.TrimPrefix(line, "rename from "))
+		case strings.HasPrefix(line, "rename to "):
+			cur.Renamed = true
+			cur.MetadataNewPath = changedMetadataPath(strings.TrimPrefix(line, "rename to "))
+		case strings.HasPrefix(line, "copy from "):
+			cur.Copied = true
+			cur.MetadataOldPath = changedMetadataPath(strings.TrimPrefix(line, "copy from "))
+		case strings.HasPrefix(line, "copy to "):
+			cur.Copied = true
+			cur.MetadataNewPath = changedMetadataPath(strings.TrimPrefix(line, "copy to "))
+		case strings.HasPrefix(line, "new file mode "):
+			cur.MetadataOldPath = ""
+		case strings.HasPrefix(line, "deleted file mode "):
+			cur.MetadataNewPath = ""
 		case strings.HasPrefix(line, "--- "):
 			cur.OldPath = diffPathSide(strings.TrimPrefix(line, "--- "))
+			cur.MetadataOldPath = cur.OldPath
 		case strings.HasPrefix(line, "+++ "):
 			cur.NewPath = diffPathSide(strings.TrimPrefix(line, "+++ "))
+			cur.MetadataNewPath = cur.NewPath
 		default:
 			// metadata between header and first hunk (index, mode, rename …)
 		}
@@ -627,39 +563,13 @@ func parseBlobSymbols(src []byte, path string) ([]symbols.Symbol, bool) {
 // class), deduplicated by name. Function-local declarations are skipped so a
 // change inside a body is attributed to the function, not a local on that line.
 func innermostChanged(syms []symbols.Symbol, lines map[int]bool) []symbols.Symbol {
-	if len(lines) == 0 {
-		return nil
-	}
-	sorted := make([]int, 0, len(lines))
-	for line := range lines {
-		sorted = append(sorted, line)
-	}
-	sort.Ints(sorted)
-
-	// Per changed line, the most specific containing definition. Visiting only
-	// the changed lines inside each symbol's range (binary search into the
-	// sorted lines) avoids the O(lines × symbols) scan on huge rewrites.
-	best := make(map[int]*symbols.Symbol, len(sorted))
-	for i := range syms {
-		s := &syms[i]
-		if !isChangedUnit(s.Kind, s.Depth) {
-			continue
-		}
-		for j := sort.SearchInts(sorted, s.StartLine); j < len(sorted) && sorted[j] <= s.EndLine; j++ {
-			line := sorted[j]
-			if b := best[line]; b == nil || (s.EndLine-s.StartLine) < (b.EndLine-b.StartLine) {
-				best[line] = s
-			}
-		}
-	}
-
+	selected, _ := innermostChangedDefinitions(syms, lines)
 	seen := map[string]bool{}
 	var out []symbols.Symbol
-	for _, line := range sorted {
-		s := best[line]
-		if s != nil && !seen[s.Name] {
+	for _, s := range selected {
+		if !seen[s.Name] {
 			seen[s.Name] = true
-			out = append(out, *s)
+			out = append(out, s)
 		}
 	}
 	return out

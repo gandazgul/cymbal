@@ -97,6 +97,11 @@ if err != nil {
 
 Call this before queries. It runs an incremental reindex, re-parsing only files that changed since the last index. It returns the number of files refreshed (0 if nothing changed) and reports failures separately. On a partial refresh, the count includes successful changes and the error describes the incomplete refresh.
 
+Static JS/TS barrel re-exports (`export ... from` and `export * from`) are
+stored as imports. Older indexes reparse unchanged files once on the next full
+refresh to add these edges. A scoped or failed upgrade does not mark the full
+index upgraded. This does not resolve aliases or dynamic imports.
+
 If the database doesn't exist yet, it auto-indexes from the current working directory's git root. The older `index.EnsureFresh(dbPath) int` API remains available for callers that deliberately accept stale results; it returns 0 on failure.
 
 ---
@@ -195,6 +200,151 @@ for _, i := range impact {
 ```
 
 Follows the call graph upward: what calls this function, what calls those callers. Answers "what breaks if I change this?"
+
+### Select affected tests
+
+`index.FindAffectedTests(dbPath, input, opts)` returns `(*index.AffectedResult,
+error)`. It owns discovery, ranking, confidence, bounds, and status. It reads
+**one current index only**: it does not refresh, invoke Git, federate across
+worktrees, print, or run tests. The caller must select the correct repository
+store, validate/normalize paths, refresh it, and supply changed input.
+
+This complete Go example initializes or refreshes a repository index and selects
+from a whole file. `root` must be an absolute repository root; `relPath` must be
+an in-repository slash-separated file path relative to that root, not cwd.
+
+```go
+package example
+
+import (
+    "fmt"
+
+    "github.com/1broseidon/cymbal/index"
+)
+
+func SelectTests(root, relPath string) (*index.AffectedResult, error) {
+    dbPath, err := index.RepoDBPath(root)
+    if err != nil {
+        return nil, err
+    }
+    stats, err := index.Index(root, dbPath, index.Options{})
+    if err != nil {
+        return nil, err
+    }
+    if stats.Errors > 0 {
+        return nil, fmt.Errorf("incomplete index: %d errors", stats.Errors)
+    }
+
+    input := index.AffectedInput{
+        Precision: "file",
+        Files: []index.AffectedFile{
+            {Path: relPath},
+        },
+    }
+    opts := index.DefaultAffectedOptions()
+    return index.FindAffectedTests(dbPath, input, opts)
+}
+```
+
+For an existing store, call `index.EnsureFreshWithError(dbPath)` before building
+input and querying, and propagate refresh errors. The example uses `Index` to
+make initialization independent of cwd. Do not treat an incomplete refresh as a
+successful empty selection.
+
+#### Input identities and options
+
+`AffectedInput` has `Files []AffectedFile`, `Symbols []AffectedSymbol`,
+`Precision string` (`"hunk"` or `"file"`), and
+`Limitations []AffectedLimitation`. File precision expands files to all their
+indexed definitions and reports `file_level_precision`; it is not hunk precision.
+Each `AffectedFile` has `Path` and `Deleted`.
+
+For hunk input, supply definitions actually touched by the change, not bare
+names. A live `AffectedSymbol` must **exactly match the current store** across
+`Path`, `Name`, `Kind`, `Language`, `StartLine`, `EndLine`, and `Deleted` (false
+for live definitions). Lines are the stored 1-based definition bounds, not hunk
+bounds. Obtain current locations and identity fields from the indexed outline
+or symbol results after refresh. Paths are repository-relative slash paths.
+Include affected files too, so symbol-free changes retain file evidence.
+
+For a removed definition, preserve its old identity with `Deleted: true`;
+mark a removed file likewise. Deleted definitions have no live graph identity.
+A stale/staged definition with different current lines or any other identity
+field becomes `missing_live_seed`, not a proven match to another same-name
+symbol. Deleted seeds remain limitations and can use heuristic file evidence.
+Callers must supply upstream gaps through `AffectedLimitation{Code, Message,
+Paths, Seeds}`, including failed attribution, unsupported input, or changes
+outside definitions. The API does not discover a Git diff or validate repository
+containment for the caller. The [CLI](../reference/commands.md#cymbal-affected-tests)
+adds cwd resolution, cross-platform separator handling, and repository-root checks.
+
+Start with `DefaultAffectedOptions()`, not a zero-valued `AffectedOptions`:
+
+| Field | Default | Constraint |
+|-------|---------|------------|
+| `Depth` | 2 | 1–5; symbol and reverse-import depth |
+| `Limit` | 50 | Positive; selected files after ranking |
+| `MaxSymbols` | 40 | Nonnegative; 0 unlimited seed definitions |
+| `MaxEvidence` | 500 | Nonnegative; 0 unlimited examined dependency records |
+| `TestPaths` | empty | Additional test classification patterns, substring or glob with `**` |
+| `Scope` | `ResolveScopeFamily` | `ResolveScopeSame`, `ResolveScopeFamily`, or `ResolveScopeAll`; empty normalizes to family |
+
+#### Results and interpretation
+
+`AffectedResult` includes `SchemaVersion`, `Status`, `InputPrecision`, effective
+`Bounds`, `Tests`, `Limitations`, `Fallback`, `Advisory`, and
+`StaticAnalysisLimit`. Each `AffectedTest` includes `Path`, 1-based `Rank`,
+`Confidence`, `Distance *int`, `ChangedSymbols`, and `Evidence`. Evidence retains
+`Kind`, `Seed`, `Distance`, `Ambiguous`, `Confidence`, and ordered
+location-bearing `Steps`. Import steps retain raw import and target. File-only
+selections have no changed symbols and retain a changed-file seed in evidence.
+Empty result collections serialize as `[]`, not `null`.
+
+Evidence classes, strongest first, are `changed_test`, `direct_symbol`,
+`transitive_symbol`, `direct_import`, `colocated`, and `reverse_import`.
+Ranking compares strongest class, its shortest distance, ambiguity penalty,
+independent support within that class descending, then normalized path. Distinct terminal
+sites or seeds add support; duplicate discovery does not. Canonical shortest
+explanations and sorted evidence/identities make results deterministic for the
+same repository state, options, and implementation. Rankings can change across
+algorithm releases. `Distance` is the shortest actual dependency distance across
+evidence, not a score; it is nil for naming-only matches.
+
+Confidence is evidence strength, not coverage probability: changed tests and
+unambiguous hunk-precise direct references are high; unambiguous transitive
+references and whole-file direct references are medium; ambiguous, import-only,
+and colocated-only explanations are low. The best retained evidence determines
+confidence; many weak matches do not upgrade it.
+
+`Status` is `complete` for a supported scan without detected gaps (including
+empty input), `partial` when some analysis has input/precision/traversal/inference
+gaps, or `unavailable` when nonempty input has no analyzable seed or applicable
+evidence. No matching test for an otherwise analyzed seed alone is not
+unavailable. Whole-file precision, heuristic inference, missing live/deleted
+seeds, encountered indirect dispatch, and budget cutoffs remain limitations.
+General static limits alone do not force every scan to partial. For partial or
+unavailable, `Fallback.Recommended` is true and `Fallback.Reason` says to run the
+full suite. A nil error can return any advisory status; operational query
+errors return an error instead. **No status proves unselected tests safe to skip.**
+
+Classification uses file paths, not runnable-test discovery. Traversal stops at
+the first classified test, including helpers such as `tests/helpers.ts`,
+`testdata/*`, and `conftest.py`; unknown-class helpers such as `testutil/*` remain
+traversable. References match names, not resolved runtime dispatch. Aliases,
+callbacks, reflection, and interface dispatch are not fully resolved. Imports
+use low-confidence raw suffix/basename/package heuristics. Colocated matches
+check only existing same-directory Go `<stem>_test.go`, JS/TS
+`<stem>.test.*`/`<stem>.spec.*` (js/jsx/ts/tsx/mjs/cjs/mts/cts counterparts),
+and Python `test_<stem>.py`/`<stem>_test.py` for `.py` sources; they do not infer
+all test naming conventions.
+
+JSON tags use `schema_version: 1`. Preserve existing meanings within that
+version, tolerate unknown additive fields, and require a new schema version for
+breaking changes. The CLI alone wraps this result in the unchanged
+`{"version":"0.1","results":...}` envelope; the API returns the typed result,
+not that envelope. See the [command contract](../reference/commands.md#cymbal-affected-tests)
+for detailed evidence/status rules. Requirement source:
+[issue #77](https://github.com/1broseidon/cymbal/issues/77).
 
 ### Find importers
 

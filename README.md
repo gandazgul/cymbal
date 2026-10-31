@@ -181,7 +181,7 @@ incrementally and only reparse changed files.
 
 ## Why Cymbal
 
-For both humans and agents, three commands cover most investigations:
+For both humans and agents, these commands cover common investigations:
 
 | Command | Question it answers | Direction |
 |---|---|---|
@@ -189,6 +189,7 @@ For both humans and agents, three commands cover most investigations:
 | `trace X` | "What does X depend on?" | Downward: callees |
 | `impact X` | "What depends on X?" | Upward: callers (split production/test) |
 | `changed` | "What does my current diff affect?" | Diff -> changed symbols + impact |
+| `affected-tests` | "Which test paths are relevant to these changes?" | Diff or files -> ranked, explained advisory selection |
 
 This matters because a normal code-reading loop often turns into
 search -> show -> refs -> show-next-function -> repeat. Cymbal collapses that
@@ -203,6 +204,7 @@ into fewer, more relevant tool calls with structured output.
 | `trace` | Downward call graph. Add `--graph` for a visual dependency map |
 | `impact` | Upward caller graph (callers split production/test; `--no-tests` to focus). Add `--graph` for a visual blast-radius map |
 | `changed` | Diff-scoped impact: maps your git diff (working tree / `--staged` / `--base`) to changed symbols + their impact in one call |
+| `affected-tests` | Select ranked test paths from a diff or files, with evidence, confidence, and gap reports; advisory only |
 | `importers` | Reverse import lookup. Add `--graph` for a visual fan-in map |
 | `impls` | Find implementers / conformers / extensions. Add `--graph` for a conformance map |
 | `search` | Symbol search, or `--text` for grep-style lookup |
@@ -224,6 +226,29 @@ cymbal investigate Foo Bar Baz
 
 All commands support `--json` for structured output. For full flags and
 examples, see [docs/reference/commands.md](docs/reference/commands.md).
+
+### Select affected test paths
+
+```sh
+cymbal affected-tests                 # unstaged changes, not untracked files
+cymbal affected-tests --staged        # staged changes versus HEAD
+cymbal affected-tests --base main     # working tree versus one ref
+cymbal affected-tests internal/auth/handler.go --json
+printf '%s\n' 'internal/auth/handler.go' | cymbal affected-tests --stdin --quiet
+```
+
+This selector uses only the current Git repository's index, never sibling
+worktrees. It ranks changed tests, symbol references, import candidates, and
+same-directory naming matches. Paths classified as tests can be helpers, not
+runnable tests. Selection does not run tests or prove that unselected tests are
+safe to skip. `partial` and `unavailable` results recommend the full suite and
+still exit zero; operational errors exit nonzero.
+
+See the [command contract](docs/reference/commands.md#cymbal-affected-tests)
+for flags, ranking, path-input limits, and the versioned JSON schema, or the
+[library API](docs/guide/library.md#select-affected-tests) for embedding.
+[Issue #77](https://github.com/1broseidon/cymbal/issues/77) is the requirement
+source.
 
 ## Graph Mode
 
@@ -280,6 +305,9 @@ the seed symbol — different branches have different code, so connecting them
 would produce wrong answers. Pass `--no-federate` to opt out, or set `--db`
 / `CYMBAL_DB` to pin a single DB. Unindexed sibling worktrees are silently
 skipped — run `cymbal index .` inside any worktree you want included.
+
+`affected-tests` always stays in the current worktree, even without
+`--no-federate`. Its database root must match the current Git repository.
 
 Cymbal skips common generated and unusually large source files during indexing,
 including tree-sitter parser tables, protobuf outputs, minified JavaScript, and
