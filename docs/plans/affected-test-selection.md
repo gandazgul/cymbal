@@ -31,6 +31,12 @@ deliveryBranch: "plan/affected-test-selection"
 routingIntent: "PLANNED_CHANGE"
 sessionName: "Affected Tests Command"
 status: "reviewed"
+validatedCommit: "5d79a691100392f31520092271b7d11afaaa15ba"
+workRecord:
+  status: "generated"
+  recordId: "def7e004-266a-42d9-888e-7d50c0cd9f25"
+  path: "docs/work-records/2026-10-31-ranked-explainable-affected-test-selection.md"
+  lastAttemptAt: "2026-10-31T17:24:53.047Z"
 ---
 
 # Ranked, Explainable Affected-Test Selection
