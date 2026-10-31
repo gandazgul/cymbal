@@ -36,3 +36,6 @@ plans/
 .review/
 .tmp-smoke/
 .brainfile/
+# BEGIN RunWield owned runtime state
+.wld/internal/
+# END RunWield owned runtime state
