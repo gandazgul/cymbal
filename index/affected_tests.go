@@ -518,6 +518,9 @@ func (q *affectedScan) walkSymbols(seed AffectedSymbol) (bool, error) {
 			// visited production definitions do not imply omitted traversal.
 			owners := q.enclosing(r.Path, r.Line)
 			terminal := q.classifier.Classify(r.Path) == PathClassTest
+			if r.Kind == "implements" || r.Kind != "call" && !terminal {
+				q.limit("indirect_dispatch", "Production non-call or implements relationship does not resolve runtime dispatch.", r.Path, &seed)
+			}
 			if n.depth >= q.opts.Depth {
 				unvisited := len(owners) == 0
 				for _, owner := range owners {
@@ -527,10 +530,6 @@ func (q *affectedScan) walkSymbols(seed AffectedSymbol) (bool, error) {
 					q.limit("depth_truncation", "Additional symbol relationships remain beyond the depth bound.", r.Path, &seed)
 				}
 				continue
-			}
-			indirect := r.Kind != "call" && !terminal
-			if indirect {
-				q.limit("indirect_dispatch", "Production non-call or implements relationship does not resolve runtime dispatch.", r.Path, &seed)
 			}
 			amb := n.ambiguous
 			if !terminal && len(owners) > 1 {

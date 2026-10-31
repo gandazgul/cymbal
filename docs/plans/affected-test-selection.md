@@ -30,7 +30,7 @@ targetBranch: "main"
 deliveryBranch: "plan/affected-test-selection"
 routingIntent: "PLANNED_CHANGE"
 sessionName: "Affected Tests Command"
-status: "implemented"
+status: "reviewed"
 ---
 
 # Ranked, Explainable Affected-Test Selection

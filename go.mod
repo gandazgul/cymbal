@@ -2,6 +2,8 @@ module github.com/1broseidon/cymbal
 
 go 1.26.9
 
+toolchain go1.27.3
+
 require (
 	github.com/coder3101/tree-sitter-proto v0.0.0-20250826173151-a1fbf36c3029
 	github.com/mattn/go-sqlite3 v1.14.37
