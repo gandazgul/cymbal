@@ -403,7 +403,9 @@ func (e *symbolExtractor) extractImportPython(nodeType string, node *sitter.Node
 }
 
 func (e *symbolExtractor) extractImportJS(nodeType string, node *sitter.Node) (symbols.Import, bool) {
-	if nodeType == "import_statement" {
+	// Static re-exports create the same file dependency as imports. Local
+	// exports have no source field and must not create an import record.
+	if nodeType == "import_statement" || nodeType == "export_statement" {
 		sourceNode := node.ChildByFieldName("source")
 		if sourceNode != nil {
 			raw := strings.Trim(sourceNode.Utf8Text(e.src), "\"'`")

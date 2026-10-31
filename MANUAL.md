@@ -135,6 +135,7 @@ the call graph. Getting this right is most of the tool.
 | Just show me the code | `show` | no graph walk |
 | Source, types, callers and imports at once | `context` | one bundled read |
 | What did I just break? | `changed` | git diff → symbols → impact |
+| Which test paths are relevant to my changes? | `affected-tests` | diff or files → ranked advisory selection |
 
 > `investigate` is the one to reach for when you don't know which of the others
 > you want. It looks at the symbol's kind and returns the right shape: functions
@@ -143,7 +144,7 @@ the call graph. Getting this right is most of the tool.
 
 ## Commands
 
-Nineteen commands. Four flags are global; everything else is per-command.
+The flags below are global; everything else is per-command.
 
 | Flag | Meaning |
 | --- | --- |
@@ -152,7 +153,8 @@ Nineteen commands. Four flags are global; everything else is per-command.
 | `--no-federate` | restrict to a single database, no cross-worktree federation |
 | `-v, --version` | print version and exit |
 
-Passive update notices are suppressed automatically under `--json`. Set
+Passive update notices are suppressed automatically under `--json` and
+`affected-tests --quiet`. Set
 `CYMBAL_NO_UPDATE_NOTIFIER=1` to disable them entirely.
 
 ### Graph output
@@ -290,6 +292,118 @@ Changed symbols are attributed by parsing the diffed blobs on both sides, so
 whole-symbol deletions are named rather than mis-attributed to a neighbour.
 Deleted symbols are listed but have no impact — they no longer exist.
 
+#### affected-tests — Ranked, explained test-path selection
+
+```console
+$ cymbal affected-tests                    # unstaged working tree vs index
+$ cymbal affected-tests --staged           # staged index vs HEAD
+$ cymbal affected-tests --base main        # working tree vs one ref
+$ cymbal affected-tests src/auth.ts --json # all indexed definitions in a file
+$ printf '%s\n' 'src/auth.ts' | cymbal affected-tests src/api.ts --stdin --quiet
+```
+
+The default diff excludes untracked files. Diff attribution uses both old and
+new blobs; staged attribution uses staged content even if disk differs. The
+graph is always the refreshed current working-tree index. Missing live or
+deleted definitions remain limitations, not resolved same-name substitutes.
+
+| Flag | Meaning |
+| --- | --- |
+| `--staged` | staged comparison (default false) |
+| `--base <ref>` | one ref, not a range or an option-like ref (default unset) |
+| `--stdin` | newline-separated file paths; may combine with arguments (default false) |
+| `-D, --depth <n>` | symbol and reverse-import depth, 1–5 (default 2) |
+| `-n, --limit <n>` | selected files after ranking, positive only (default 50) |
+| `--max-symbols <n>` | seed definition budget (default 40, 0 unlimited) |
+| `--max-evidence <n>` | examined dependency records across the query (default 500, 0 unlimited) |
+| `--test-path <pat>` | additional test path classification; substring or glob with `**`, repeatable |
+| `--resolve-scope <s>` | same \| family \| all (default family) |
+| `--quiet` | paths only on stdout; advice on stderr (default false) |
+| `--json` | structured result instead of ranked text (default false) |
+
+Negative budgets are invalid. `--staged` conflicts with `--base`; explicit files
+or `--stdin` conflict with either diff flag. `--json` conflicts with `--quiet`.
+Validation happens before Git analysis or index refresh.
+
+All five modes require the current Git repository. There is **no sibling
+worktree federation**, even without `--no-federate`. `--db`/`CYMBAL_DB` are
+honored only when the stored database root matches the current repository.
+
+**File input:** arguments and stdin are a deduplicated union, with whole-file
+precision. Empty `--stdin` is empty explicit input, not the working diff. CRLF
+and empty lines are accepted; spaces and leading `#` are preserved, not comments.
+Paths resolve from cwd, including subdirectories, and output uses repo-relative
+`/` paths. Both `/` and `\` are separators on all platforms, so literal Unix
+backslashes cannot be represented distinctly. Paths outside the repository
+(including symlink escapes) are rejected; missing in-repo files remain limitations.
+Supply files, not directories. There is no glob/directory expansion or shell
+evaluation by Cymbal; quote paths against shell expansion. Newline-separated
+input/output cannot represent newlines in filenames; there is no NUL mode.
+
+**Ranking:** strongest evidence first: changed test, direct symbol reference,
+transitive symbol reference, direct import, colocated naming match, then reverse
+import fallback. Ties use shortest distance in the strongest class, ambiguity
+penalty, independent support within that class descending, then normalized path. Distinct
+terminal reference/import sites or changed seeds add support; duplicates do not.
+Explanations retain canonical shortest paths and actual reference kinds.
+The same repository state, options, and implementation produce the same ordered
+results; ranking can change between algorithm releases.
+
+**Confidence** is evidence strength, not coverage probability. Changed tests and
+unambiguous hunk-precise direct references are high; unambiguous transitive
+references and whole-file direct references are medium; ambiguous, import-only,
+and naming-only evidence is low. Use the best retained evidence, not many weak
+matches. `distance` is the shortest actual dependency distance across evidence
+(0 for a changed test, null for naming-only evidence), not a score.
+
+**Classification is not runnable-test discovery.** Traversal stops at the first
+classified test file, including `tests/helpers.ts`, `testdata/*`, or `conftest.py`.
+Unknown helpers such as `testutil/*` remain traversable. A changed test is selected
+directly, not followed to its consumers. Same-directory naming inference checks
+only existing indexed `<stem>_test.go`, JS/TS `<stem>.test.*`/`<stem>.spec.*`
+(counterpart extensions js/jsx/ts/tsx/mjs/cjs/mts/cts), and Python
+`test_<stem>.py`/`<stem>_test.py` for `.py` sources. Other test conventions can
+work through references, imports, and changed-test inclusion, not universal
+naming inference.
+
+References are static name matches, not semantic dependency proofs. Aliases,
+callbacks, reflection, and interface dispatch are not fully resolved; encountered
+indirect boundaries and ambiguity are reported. Import suffix/basename/package
+matches are heuristic and low-confidence. Static JS/TS `export ... from` and
+`export * from` barrel edges are indexed as imports. Older indexes reparse
+unchanged files once on the next full refresh; a failed or scoped upgrade does
+not complete that upgrade. This adds no dynamic-import or alias resolution.
+
+**Status and JSON:** the outer envelope remains
+`{ "version": "0.1", "results": ... }`; `results.schema_version: 1` versions this
+selector's contract. Schema 1 permits additive fields; consumers must tolerate
+unknown fields. Breaking changes require a schema version increment, not a
+change to the shared outer envelope.
+
+- `complete`: supported static scan finished without a detected gap. An empty
+  diff is complete with no tests; this does not mean full test coverage.
+- `partial`: some analysis was possible, with input, precision, traversal, or
+  inference gaps. Whole-file inputs report a precision gap.
+- `unavailable`: nonempty input had no analyzable seed or applicable evidence.
+  No candidate for an otherwise analyzed seed alone is not unavailable.
+
+Results include effective bounds, ranked tests, changed-symbol identities,
+location-bearing evidence, coded limitations, fallback, and static-analysis
+advice. Empty collections are `[]`. Budget cutoffs, missing/deleted seeds,
+unsupported/binary/conflicted/unreadable inputs, renames, changes outside
+symbols, and heuristic inference remain visible. `partial` and `unavailable`
+set `fallback.recommended: true` and say to **run the full suite**.
+
+All advisory statuses exit **0**. Invalid input/options, Git, refresh, and
+query/database failures exit **nonzero**, without a success result. Quiet mode
+sends warnings and advice to stderr, with paths only on stdout. No mode runs
+tests, replaces required validation, or proves unselected tests safe to skip —
+including `complete` or an empty selection.
+
+Full field details: [command reference](docs/reference/commands.md#cymbal-affected-tests).
+Embedding: [library guide](docs/guide/library.md#select-affected-tests).
+Requirement source: [issue #77](https://github.com/1broseidon/cymbal/issues/77).
+
 #### diff — Git diff scoped to one symbol's line range
 
 ```console
@@ -426,6 +540,9 @@ internal/api/router.go (2 sites):
   > handleAuth(w, r)
 ```
 
+`affected-tests` is an exception: normal output is ranked text with explanations
+and advice, or path-only output with `--quiet`.
+
 Identical call sites in the same file are grouped, so the agent sees the pattern
 without paying for the repetition.
 
@@ -438,7 +555,7 @@ can dispatch several lookups.
 ### Batching over round-trips
 
 Most query commands accept multiple symbols, and `--stdin` reads
-newline-separated names. One call beats five.
+newline-separated names. `affected-tests --stdin` reads paths instead. One call beats five.
 
 ```console
 $ cymbal show Foo Bar Baz
@@ -490,3 +607,5 @@ tree aren't supported.
 Symbols federate across worktrees of the same repo by default, so a query in one
 worktree can resolve into another. Pass `--no-federate` to restrict to a single
 database.
+
+`affected-tests` is always current-worktree only; it does not federate.
